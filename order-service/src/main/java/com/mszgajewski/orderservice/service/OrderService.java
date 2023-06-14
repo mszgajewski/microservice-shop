@@ -1,20 +1,24 @@
 package com.mszgajewski.orderservice.service;
 
+import com.mszgajewski.orderservice.dto.InventoryResponse;
 import com.mszgajewski.orderservice.dto.OrderLineItemsDto;
 import com.mszgajewski.orderservice.dto.OrderRequest;
+import com.mszgajewski.orderservice.event.OrderPlacedEvent;
 import com.mszgajewski.orderservice.model.Order;
 import com.mszgajewski.orderservice.model.OrderLineItems;
 import com.mszgajewski.orderservice.repository.OrderRepository;
-import com.mszgajewski.productservice.dto.ProductRequest;
-import com.mszgajewski.productservice.dto.ProductResponse;
-import com.mszgajewski.productservice.model.Product;
-import com.mszgajewski.productservice.repository.ProductRepository;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
+import org.springframework.web.reactive.function.client.WebClient;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
@@ -38,12 +42,32 @@ public class OrderService {
               .map(this::mapToDto)
               .toList();
 
-      order.getOrderLineItemsList(orderLineItems);
+      order.setOrderLineItemsList(orderLineItems);
 
       List<String> skuCodes = order.getOrderLineItemsList().stream()
               .map(OrderLineItems::getSkuCode)
               .toList();
 
+      Observation inventoryServiceObservation = Observation.createNotStarted("inventory-service-lookup",
+              this.observationRegistry);
+      inventoryServiceObservation.lowCardinalityKeyValue("call","inventory-service");
+      return inventoryServiceObservation.observe(()->{
+         InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
+                 .uri("http://inventory-service/api/inventory",
+                         uriBuilder -> uriBuilder.queryParam("skuCode",skuCodes).build())
+                 .retrieve()
+                 .bodyToMono(InventoryResponse[].class)
+                 .block();
+         boolean allProductsInStock = Arrays.stream(inventoryResponseArray)
+                 .allMatch(InventoryResponse::isInStock);
+         if (allProductsInStock){
+            orderRepository.save(order);
+            applicationEventPublisher.publishEvent(new OrderPlacedEvent(this,order.getOrderNumber()));
+            return "Order Placed";
+         } else {
+            throw new IllegalArgumentException("Brak produktu, proszę spróbować później");
+         }
+      });
    }
 
    private OrderLineItems mapToDto(OrderLineItemsDto orderLineItemsDto) {
